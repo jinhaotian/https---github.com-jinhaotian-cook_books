@@ -1,0 +1,233 @@
+#!/bin/sh
+#
+# THIS FILE IS MANAGED BY CHEF.  DO NOT EDIT.
+#
+# To incorporate changes, open a BZ ticket with Techops
+# 
+# chkconfig: - 80 20
+# description: Tomcat 4.0 is the Apache Servlet Engine RI for Servlet 2.3/JSP 1.2
+# processname: tomcat
+# pidfile: /var/run/tomcat4.pid
+# config:  /etc/tomcat4.conf
+
+# Source function library.
+if [ -x /etc/init.d/functions ]; then
+. /etc/init.d/functions
+fi
+
+for i in `ls -d /var/tom*`; do
+        j=$(echo $i | sed -e 's/\/var\/tom//')
+        AVAILNODES="$AVAILNODES $j"
+done
+AVAILNODES=$(echo $AVAILNODES | egrep -v disabled | sed -e 's/^[ \t]*//')
+
+# XXX: FIMXE: Get Tomcat config
+
+source_config() {
+        VERSIONS="4 5 6 7"
+        TOMCAT_CFG=""
+        for version in $VERSIONS; do
+                if [ -f /var/$TOMCAT_PROG/conf/tomcat$version.conf ]; then
+                        if [ "$TOMCAT_CFG" = "" ]; then
+                                TOMCAT_CFG="/var/$TOMCAT_PROG/conf/tomcat$version.conf"
+                        else
+                                echo "/var/$TOMCAT_PROG/conf/tomcat$version.conf found, but config is already set to $TOMCAT_CFG" >&2
+                        fi
+                fi
+        done
+
+        [ -r "$TOMCAT_CFG" ] && . "${TOMCAT_CFG}"
+
+        [ -r "/var/$TOMCAT_PROG/bin/setenv.sh" ] && . /var/$TOMCAT_PROG/bin/setenv.sh
+}
+
+
+RETVAL=0
+
+# See how we were called.
+start() {
+        for NODE in $NODES; do
+                TOMCAT_PROG="tom$NODE"
+                TOMCAT_USER="tom$NODE"
+                source_config
+                TOMCAT_START_SCRIPT=$CATALINA_HOME/bin/startup.sh
+                TOMCAT_STOP_SCRIPT=$CATALINA_HOME/bin/shutdown.sh
+
+                # hacktastic shit to fix perms here for now
+                chown -R $TOMCAT_USER /var/$TOMCAT_PROG/logs
+                chgrp -R software /var/$TOMCAT_PROG/logs
+                chmod 400 /var/$TOMCAT_PROG/conf/jmxremote.access 2>/dev/null
+                chmod 400 /var/$TOMCAT_PROG/conf/jmxremote.password 2>/dev/null
+
+                echo "Starting $TOMCAT_PROG: "
+
+                # force pwd to be the catalina base
+                cd /var/$TOMCAT_PROG
+                su -m -s /bin/sh -c "$TOMCAT_START_SCRIPT" $TOMCAT_USER
+                RETVAL=$?
+
+                sleep 3
+                echo
+                if [ $RETVAL = 0 ]; then
+                        touch /var/lock/subsys/$TOMCAT_PROG
+                        echo "$TOMCAT_PROG startup successful"
+                else 
+                        echo "ERROR: $TOMCAT_PROG FAILED TO STARTUP PROPERLY"
+                fi
+                return $RETVAL
+        done
+}
+
+stop() {
+        for NODE in $NODES; do
+                TOMCAT_PROG="tom$NODE"
+                TOMCAT_USER="tom$NODE"
+                source_config
+                TOMCAT_START_SCRIPT=$CATALINA_HOME/bin/startup.sh
+                TOMCAT_STOP_SCRIPT=$CATALINA_HOME/bin/shutdown.sh
+
+                # make sure the logfile exists with correct perms before echo'ing
+                # stuff to it, otherwise we clobber the perms
+    
+                if [ ! -e /var/$TOMCAT_PROG/logs/catalina.out ]; then
+	                touch /var/$TOMCAT_PROG/logs/catalina.out
+                fi
+
+                chown -R $TOMCAT_USER /var/$TOMCAT_PROG/logs
+                chgrp -R software /var/$TOMCAT_PROG/logs
+
+                echo "Sending stackdump to $TOMCAT_PROG: " 
+                echo "TOMCAT STOP SCRIPT SENDING STACKDUMP" >> /var/$TOMCAT_PROG/logs/catalina.out
+                pkill -3 -u $TOMCAT_USER -f .*java.*catalin.*
+                sleep 2
+
+                echo "Stopping $TOMCAT_PROG: "
+
+                if [ -f /var/lock/subsys/$TOMCAT_PROG ] ; then
+                        su -m -s /bin/sh -c "$TOMCAT_STOP_SCRIPT" $TOMCAT_USER &>/dev/null
+                        RETVAL=$?
+
+                        # wait 30 seconds after a clean shutdown before killing
+
+                        count=1
+                        pids=`pgrep -d ' ' -u $TOMCAT_USER -f .*java.*catalina.*`
+                        while [ $count -ne 30 ] && [ -n "$pids" ];
+                        do
+                                echo "Waiting 1s on $TOMCAT_USER java pids: $pids"
+                                sleep 1
+                                count=$(( $count + 1))
+                                pids=`pgrep -d ' ' -u $TOMCAT_USER -f .*java.*catalina.*`
+                        done
+
+                        # kill if anything is still around
+
+                        if [ -n "$pids" ]; then
+	                        echo "Stack dumping remaining tomcat threads"
+                                echo "HUNG THREADS DETECTED ON EXIT BY STOP SCRIPT" >> /var/$TOMCAT_PROG/logs/catalina.out
+                                pkill -3 -u $TOMCAT_USER -f .*java.*catalina.*
+                                sleep 3
+	                        echo "Killing $TOMCAT_USER java pids: $pids"
+                                pkill -9 -u $TOMCAT_USER -f .*java.*catalina.*
+				sleep 60	#killed process need more time to clean up
+                        fi
+
+                        sleep 6
+
+                        # wait up to 300 seconds after a kill for the proc table to clear
+
+                        count=1
+                        pids=`pgrep -d ' ' -u $TOMCAT_USER -f .*java.*catalina.*`
+                        while [ $count -ne 300 ] && [ -n "$pids" ];
+                        do
+                                echo "Waiting 1s on $TOMCAT_USER java pids: $pids"
+                                sleep 1
+                                count=$(( $count + 1))
+                                pids=`pgrep -d ' ' -u $TOMCAT_USER -f .*java.*catalina.*`
+                        done
+
+                        if [ -n "$pids" ]; then
+                                echo "ERROR: $TOMCAT_PROG FAILED TO SHUTDOWN PROPERLY"
+	                        RETVAL=255
+                        else
+                                echo "$TOMCAT_PROG shutdown successful"
+                                RETVAL=0
+                        fi
+                    
+                        rm -f /var/lock/subsys/$TOMCAT_PROG /var/run/$TOMCAT_USER.pid
+                else
+                        echo "no lockfile, $TOMCAT_PROG not previously started, skipping shutdown"
+                fi
+        done
+}
+
+#
+#  if /var/tomXXXX/logs/gclog.txt exists, rotate it.
+#
+#  RNWK standard opt for gclogs is: -Xloggc:/var/tomXXXX/logs/gclog.txt
+#
+
+gclog() {
+        for NODE in $NODES; do
+                TOMCAT_PROG="tom$NODE"
+                if [ -f /var/$TOMCAT_PROG/logs/gclog.txt ]; then
+	                cp -f /var/$TOMCAT_PROG/logs/gclog.txt /var/$TOMCAT_PROG/logs/gclog-`date +%Y-%m-%d-%H:%M:%S`.txt
+                fi
+        done
+}
+
+usage() {
+        echo "Usage: `basename $0` <nodename> [start|stop|restart]"
+        echo "       Available Nodes: $AVAILNODES"
+}
+
+if [ $# -eq 0 ]; then
+        usage
+        exit 1
+fi
+
+while [ $# -gt 0 ]; do
+        case $1 in
+                start|stop|status|restart)
+                        COMMAND=$1
+                        shift
+                        ;;
+
+                *)
+                        if [ -d /var/tom$1 ]; then
+                                NODES=$1
+                                shift
+                        else
+                                usage
+                                exit 1
+                        fi
+                        ;;
+
+        esac
+done
+
+if [ -z $NODES ]; then
+        NODES=$AVAILNODES
+fi
+
+case $COMMAND in
+  start)
+	gclog
+        start
+        ;;
+  stop)
+	gclog
+        stop
+        ;;
+  restart)
+	gclog
+        stop
+        sleep 2
+        start
+        ;;
+  *)
+        echo "Usage: $TOMCAT_PROG {start|stop|restart}"
+        exit 1
+esac
+
+exit $RETVAL
+
